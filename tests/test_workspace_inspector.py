@@ -57,9 +57,20 @@ def test_detect_rust_workspace(tmp_path: Path):
     assert profile.install_command == "cargo check"
 
 
-def test_detect_taskfile_priority(tmp_path: Path):
+def test_detect_taskfile_priority_when_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (tmp_path / "Taskfile.yml").write_text("version: '3'\ntasks:\n  test:\n    cmds:\n      - pytest -v\n")
     (tmp_path / "requirements.txt").write_text("pytest\n")
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/task" if cmd == "task" else None)
 
     profile = WorkspaceInspector.inspect(tmp_path)
     assert profile.test_command == "task test"
+
+
+def test_detect_taskfile_fallback_when_task_binary_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    (tmp_path / "Taskfile.yml").write_text("version: '3'\ntasks:\n  test:\n    cmds:\n      - pytest -v\n")
+    (tmp_path / "requirements.txt").write_text("pytest\n")
+    monkeypatch.setattr("shutil.which", lambda cmd: None)
+
+    profile = WorkspaceInspector.inspect(tmp_path)
+    # When 'task' is not installed, must fall back to native language test runner (pytest)
+    assert profile.test_command == "pytest -v"

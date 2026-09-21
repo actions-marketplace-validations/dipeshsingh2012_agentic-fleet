@@ -26,6 +26,18 @@ class TestResult:
     failed_tests: int = 0
     skipped_tests: int = 0
 
+    def __post_init__(self):
+        if self.total_tests == 0 and self.passed_tests == 0 and self.failed_tests == 0:
+            full_text = (self.stdout or "") + ("\n" + self.stderr if self.stderr else "")
+            passed_m = re.search(r"(\d+)\s+passed", full_text, re.IGNORECASE)
+            failed_m = re.search(r"(\d+)\s+failed", full_text, re.IGNORECASE)
+            skipped_m = re.search(r"(\d+)\s+skipped", full_text, re.IGNORECASE)
+            if passed_m or failed_m or skipped_m:
+                self.passed_tests = int(passed_m.group(1)) if passed_m else 0
+                self.failed_tests = int(failed_m.group(1)) if failed_m else 0
+                self.skipped_tests = int(skipped_m.group(1)) if skipped_m else 0
+                self.total_tests = self.passed_tests + self.failed_tests + self.skipped_tests
+
     @property
     def is_success(self) -> bool:
         return self.exit_code == 0 and self.failed_tests == 0

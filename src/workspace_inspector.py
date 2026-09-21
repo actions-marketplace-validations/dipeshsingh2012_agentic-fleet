@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -125,18 +126,19 @@ class WorkspaceInspector:
     @classmethod
     def _resolve_test_command(cls, workspace_dir: Path, profile: WorkspaceProfile) -> str:
         """Determines the most accurate test execution command based on manifests."""
+        # Check Taskfile runner only if 'task' executable is present on PATH
         if (workspace_dir / "Taskfile.yml").exists() or (workspace_dir / "Taskfile.yaml").exists():
             taskfile_content = (workspace_dir / "Taskfile.yml").read_text(encoding="utf-8", errors="ignore") if (workspace_dir / "Taskfile.yml").exists() else ""
-            if "test:" in taskfile_content:
+            if "test:" in taskfile_content and shutil.which("task"):
                 return "task test"
 
-        if "rust" in profile.detected_languages:
+        if profile.primary_language == "rust":
             return "cargo test"
 
-        if "go" in profile.detected_languages:
+        if profile.primary_language == "go":
             return "go test ./..."
 
-        if "typescript" in profile.detected_languages or "javascript" in profile.detected_languages:
+        if profile.primary_language in ["typescript", "javascript"]:
             pkg_path = workspace_dir / "package.json"
             if pkg_path.exists():
                 try:
@@ -148,7 +150,7 @@ class WorkspaceInspector:
                     pass
             return "npm test"
 
-        if "java" in profile.detected_languages:
+        if profile.primary_language == "java":
             if (workspace_dir / "pom.xml").exists():
                 return "mvn test"
             if (workspace_dir / "build.gradle").exists():

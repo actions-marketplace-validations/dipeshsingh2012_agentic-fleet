@@ -77,7 +77,7 @@ def sanitize_csv_cell(value: Any) -> str:
     cleaned = val_str.strip()
     dangerous_chars = ('=', '+', '-', '@', '\t', '\r')
     if cleaned.startswith(dangerous_chars):
-        return f"'{val_str}"
+        return f"'{cleaned}"
     return val_str
 
 def sanitize_filename_part(part: str) -> str:
@@ -127,4 +127,6 @@ def test_generate_csv_chunks():
 2. **Multi-Tenant Isolation**: Validate `tenant_id` from `Header(alias="X-Tenant-ID")`.
 3. **CSV / Formula Injection**: Always prepend single quotes (`'`) to escape formula characters (`=`, `+`, `-`, `@`, `\t`, `\r`).
 4. **Pytest Test Integrity**: Place all tests in `backend/tests/` with correct imports (`from app...`).
-5. **Dependency Manifest Integrity**: If your implementation introduces new third-party imports (e.g. `PyJWT`, `email-validator` for `pydantic.EmailStr`, `google-auth`, etc.), you **MUST** output the updated dependency manifest (e.g. ````text:backend/requirements.txt````, ````toml:pyproject.toml````, or ````json:package.json````). Never leave imported packages undeclared!
+5. **Dependency Manifest Integrity**: If your implementation introduces new third-party imports (e.g. `PyJWT`, `email-validator` for `pydantic.EmailStr`, `google-auth`, etc.), you **MUST** output the updated dependency manifest (e.g. ````text:backend/requirements.txt````, ````toml:pyproject.toml````, or ````json:package.json````). You must **PRESERVE ALL EXISTING DEPENDENCIES** and only append or update necessary packages. Never erase, truncate, or overwrite existing production dependencies!
+6. **Preserve Application Routing & Wiring**: When modifying application entrypoints or routers (such as `backend/app/main.py` or `router.py`), NEVER delete, replace, or comment out existing router mounts (e.g. `api_router`, `fleet.router`, health checks). Always preserve existing routes! Never reduce an application entrypoint down to only your isolated feature router.
+7. **Preserve Existing Test Assertions**: When remediating test failures or collection errors, NEVER alter existing test assertions across unrelated test files to fit broken output. Fix your implementation to satisfy existing test contracts.
