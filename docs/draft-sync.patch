@@ -1,0 +1,266 @@
+diff --git a/src/event_router.py b/src/event_router.py
+index a0e040e..d0d2feb 100644
+--- a/src/event_router.py
++++ b/src/event_router.py
+@@ -20,6 +20,19 @@ from src.state_manager import StateManager
+ from src.symbol_indexer import SymbolIndexer
+ from src.test_harness import TestHarness
+ from src.workspace_inspector import WorkspaceInspector, WorkspaceProfile
++from src.task_spec import TaskSpec, TaskSpecError
++from src.design_gate import (
++    parse_architect_verdict,
++    DESIGN_APPROVED,
++    CHANGES_REQUESTED,
++    INVALID,
++)
++from src.scope_gate import (
++    evaluate_pr_scope,
++    SCOPE_PASS,
++    SCOPE_BLOCK,
++    SCOPE_NEEDS_HUMAN_REVIEW,
++)
+
+ logger = logging.getLogger("agentic-fleet.event_router")
+
+@@ -620,23 +633,32 @@ class EventRouter:
+         elif event_name == "repository_dispatch":
+             action_type = payload.get("action", "") or payload.get("event_type", "")
+             client_payload = payload.get("client_payload", {})
+-            title = client_payload.get("title") or "Autonomous Feature Initiative"
+-            initiative_id = client_payload.get("initiative_id") or client_payload.get("id") or client_payload.get("item_id") or "mcp-initiative"
+-            feedback = client_payload.get("feedback") or ""
+-            prompt_text = client_payload.get("prompt") or feedback or title
++            try:
++                task_spec = TaskSpec.from_client_payload(client_payload)
++            except TaskSpecError as exc:
++                print(f"[EVENT ROUTER] 🛑 Malformed repository_dispatch client_payload: {exc}")
++                return {
++                    "status": "error",
++                    "reason": f"Invalid client_payload: {exc}",
++                }
+
+-            print(f"[EVENT ROUTER] ⚡ Processing repository_dispatch: action='{action_type}', initiative='{initiative_id}', title='{title}'")
++            title = task_spec.title
++            initiative_id = task_spec.initiative_id
++            prompt_text = task_spec.to_issue_body()
++
++            print(f"[EVENT ROUTER] ⚡ Processing repository_dispatch: action='{action_type}', initiative='{initiative_id}', title='{title}', criteria_count={len(task_spec.acceptance_criteria)}")
+
+             synthetic_issue = {
+                 "number": initiative_id,
+                 "title": title,
+                 "body": prompt_text,
+-                "labels": [{"name": "agent:autonomous"}, {"name": "source:mcp"}]
++                "labels": [{"name": "agent:autonomous"}, {"name": "source:mcp"}],
+             }
+             dispatch_payload = {
+                 **payload,
+                 "issue": synthetic_issue,
+                 "client_payload": client_payload,
++                "task_spec": task_spec.to_dict(),
+             }
+
+             if action_type in ["mcp_initiative", "mcp_spec"]:
+@@ -859,9 +881,14 @@ class EventRouter:
+                 arch_result = await self.handle_architect_agent(repo, payload)
+                 pipeline_summary["stages"]["architect_agent"] = arch_result
+
+-            if arch_result.get("verdict") == "CHANGES_REQUESTED":
+-                print(f"\n[HALT] 🛑 architect-agent design changes could not be resolved after {design_rev_count} in-flight revision(s). Halting pipeline.")
+-                pipeline_summary["status"] = "design_changes_requested"
++            if arch_result.get("verdict") != DESIGN_APPROVED:
++                verdict = arch_result.get("verdict", "UNKNOWN")
++                print(f"\n[HALT] 🛑 architect-agent did not approve design (verdict: '{verdict}'). Halting pipeline.")
++                pipeline_summary["status"] = (
++                    "design_changes_requested"
++                    if verdict == CHANGES_REQUESTED
++                    else "design_review_halted"
++                )
+                 return pipeline_summary
+             else:
+                 is_design_approved = True
+@@ -940,6 +967,10 @@ class EventRouter:
+             if dev_result.get("action") == "halted_budget_exceeded":
+                 pipeline_summary["status"] = "manual_intervention_required"
+                 return pipeline_summary
++            if dev_result.get("action") == "scope_gate_blocked":
++                print(f"\n[HALT] 🛑 dev-agent PR creation was blocked by scope gate. Halting pipeline to preserve workspace.")
++                pipeline_summary["status"] = "scope_gate_blocked"
++                return pipeline_summary
+
+         if not pr_number and not self.dry_run:
+             print(f"\n[HALT] 🛑 dev-agent could not open a Pull Request for branch `{branch_name}`. Halting pipeline.")
+@@ -1014,6 +1045,11 @@ class EventRouter:
+             if is_sec_blocked:
+                 print("\n[HALT] 🛑 Security defects detected. Halting pipeline to allow discrete dev-agent remediation.")
+                 pipeline_summary["status"] = "security_blocked_halted"
++                # Return-sync: report security halt to aroadmap
++                client_payload = payload.get("client_payload", {})
++                initiative_id = client_payload.get("initiative_id") or client_payload.get("id") or client_payload.get("item_id")
++                if initiative_id:
++                    await self._sync_status_to_aroadmap(initiative_id, "development", "security_blocked_halted", pipeline_summary.get("stages", {}))
+                 return pipeline_summary
+
+         # -------------------------------------------------------------
+@@ -1053,6 +1089,11 @@ class EventRouter:
+             if is_qa_failed:
+                 print("\n[HALT] 🛑 QA verification failed. Halting pipeline to allow discrete dev-agent remediation.")
+                 pipeline_summary["status"] = "qa_failed_halted"
++                # Return-sync: report QA halt to aroadmap
++                client_payload = payload.get("client_payload", {})
++                initiative_id = client_payload.get("initiative_id") or client_payload.get("id") or client_payload.get("item_id")
++                if initiative_id:
++                    await self._sync_status_to_aroadmap(initiative_id, "development", "qa_failed_halted", pipeline_summary.get("stages", {}))
+                 return pipeline_summary
+
+             # If QA remediated code, re-audit security invariants once to verify no security regressions
+@@ -1100,11 +1141,60 @@ class EventRouter:
+                 await self.github_client.create_issue_comment(repo, target_comment_id, final_comment)
+
+         pipeline_summary["status"] = "completed_awaiting_human_merge"
++
++        # Return-sync: report pipeline status back to aroadmap.dev
++        client_payload = payload.get("client_payload", {})
++        initiative_id = client_payload.get("initiative_id") or client_payload.get("id") or client_payload.get("item_id")
++        if initiative_id:
++            await self._sync_status_to_aroadmap(
++                initiative_id=initiative_id,
++                stage="shipped" if not is_sec_blocked and not is_qa_failed else "development",
++                pipeline_status=pipeline_summary["status"],
++                stages_summary=pipeline_summary.get("stages", {}),
++            )
++
+         print("\n=======================================================")
+         print(f"🏁 STATEFUL PIPELINE EXECUTION COMPLETE (Status: {pipeline_summary['status']})")
+         print("=======================================================\\n")
+         return pipeline_summary
+
++    async def _sync_status_to_aroadmap(
++        self,
++        initiative_id: str,
++        stage: str,
++        pipeline_status: str,
++        stages_summary: Dict[str, Any],
++    ) -> None:
++        """
++        Return-sync: report fleet pipeline status back to aroadmap.dev MCP server.
++        Called after pipeline completion or halt to keep aroadmap board in sync.
++        """
++        aroadmap_url = os.environ.get("AROADMAP_MCP_URL", "https://aroadmap.dev/api/mcp")
++        payload = {
++            "jsonrpc": "2.0",
++            "id": 1,
++            "method": "tools/call",
++            "params": {
++                "name": "transition_initiative_stage",
++                "arguments": {
++                    "item_id": initiative_id,
++                    "stage": stage,
++                    "feedback": f"Fleet pipeline status: {pipeline_status}",
++                },
++            },
++        }
++        try:
++            import httpx
++
++            async with httpx.AsyncClient(timeout=15.0) as client:
++                resp = await client.post(aroadmap_url, json=payload)
++                if resp.status_code < 300:
++                    print(f"[RETURN-SYNC] ✅ Synced status '{pipeline_status}' -> stage '{stage}' to aroadmap for initiative '{initiative_id}'")
++                else:
++                    print(f"[RETURN-SYNC] ⚠️ aroadmap sync returned HTTP {resp.status_code}: {resp.text[:200]}")
++        except Exception as exc:
++            print(f"[RETURN-SYNC] ⚠️ Failed syncing to aroadmap: {exc}")
++
+     async def handle_pm_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+         """pm-agent: clarifies vague tickets or formats full Living PRD spec and Gherkin criteria."""
+         workspace_dir = self._get_workspace_dir()
+@@ -1271,17 +1361,31 @@ class EventRouter:
+             workspace_info=ws_info,
+             issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
+         )
++        criteria = (payload.get("task_spec") or {}).get("acceptance_criteria") or []
++        criteria_block = ""
++        if criteria:
++            numbered = "\n".join(f"{i}. {c}" for i, c in enumerate(criteria, 1))
++            criteria_block = (
++                f"### Acceptance Criteria the design MUST address:\n{numbered}\n\n"
++                f"For EACH criterion above, state which section of the design covers it. "
++                f"If any criterion is missing, contradicted, or unaddressed, you MUST respond with "
++                f"DECISION: CHANGES_REQUESTED and list the uncovered criteria.\n\n"
++            )
++
+         user_input = (
+             f"{context_block}\n\n"
++            f"{criteria_block}"
+             f"### Technical Design Document under Review:\n\n{design_content}\n\n"
+-            f"Please audit this technical design against ADRs, multi-tenant isolation, data models, and test strategy."
++            f"Please audit this technical design against ADRs, multi-tenant isolation, data models, and test strategy. "
++            f"End your response with exactly one line: DECISION: DESIGN_APPROVED or DECISION: CHANGES_REQUESTED."
+         )
+         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="pro")
+
+-        is_approved = (
+-            self.dry_run
+-            or ("DESIGN_APPROVED" in response or "APPROVED" in response or "LGTM" in response or "PASSED" in response)
+-        ) and "CHANGES_REQUESTED" not in response
++        if self.dry_run:
++            verdict = DESIGN_APPROVED
++        else:
++            verdict = parse_architect_verdict(response)
++        is_approved = verdict == DESIGN_APPROVED
+
+         if not self.dry_run and isinstance(issue_number, int) and repo:
+             await self.github_client.create_issue_comment(repo, issue_number, response)
+@@ -1302,7 +1406,7 @@ class EventRouter:
+             "agent": "architect-agent",
+             "action": "design_reviewed",
+             "issue_number": issue_number,
+-            "verdict": "DESIGN_APPROVED" if is_approved else "CHANGES_REQUESTED",
++            "verdict": verdict,
+             "response": response,
+         }
+
+@@ -1576,6 +1680,42 @@ class EventRouter:
+                 print(f"[ERROR] Git push failed: {push_res.stderr} (stdout: {push_res.stdout})")
+
+             if not is_pr_remediation:
++                task_spec_data = payload.get("task_spec")
++                task_spec = TaskSpec(**task_spec_data) if task_spec_data else None
++                changed_file_paths = list(extracted_files.keys())
++
++                scope_review = await evaluate_pr_scope(
++                    diff=response,
++                    changed_files=changed_file_paths,
++                    task_spec=task_spec,
++                    llm_runner=self.llm_runner,
++                    dry_run=self.dry_run,
++                )
++
++                if not scope_review.is_passed:
++                    print(f"\n[SCOPE-GATE] 🛑 PR creation blocked by scope gate ({scope_review.verdict}): {scope_review.reason}")
++                    if isinstance(issue_number, int) and repo and not self.dry_run:
++                        gate_comment = (
++                            f"## 🛑 `scope-gate`: PR Publication Blocked\n\n"
++                            f"**Verdict**: `{scope_review.verdict}`\n\n"
++                            f"**Reason**: {scope_review.reason}\n\n"
++                            f"**Flagged files**: {', '.join(scope_review.flagged_files) or 'None'}\n\n"
++                            f"Branch `{branch_name}` is preserved. Human review required."
++                        )
++                        await self.github_client.create_issue_comment(repo, issue_number, gate_comment)
++
++                    return {
++                        "agent": "dev-agent",
++                        "action": "scope_gate_blocked",
++                        "issue_number": issue_number,
++                        "branch_name": branch_name,
++                        "scope_review": {
++                            "verdict": scope_review.verdict,
++                            "reason": scope_review.reason,
++                            "flagged_files": scope_review.flagged_files,
++                        },
++                    }
++
+                 try:
+                     pr_title = f"feat: implement Issue #{issue_number} - {issue_title}" if isinstance(issue_number, int) else f"feat: {issue_title}"
+                     pr_body = self._build_pr_markdown_body(
